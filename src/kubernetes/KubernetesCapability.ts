@@ -3,15 +3,18 @@
  *
  * Implements the standard Capability interface for Kubernetes:
  * - Cluster connection & discovery
- * - Resource and event collectors
- * - Real-time watchers
- * - Evidence generation and queuing
+ * - Explicit Resource Graph maintenance
+ * - Change Tracking (image updates, replica scaling, node shifts)
+ * - Deterministic Failure Detection (18+ canonical conditions)
+ * - Real-time Signal Correlation & Failure Chain generation
+ * - Scoped Deep Investigation Engine (with bounded log intelligence)
+ * - Typed Remediation Executor & Verification Gate
  */
 
 import { Capability, CapabilityContext } from '../capabilities/Capability.ts';
 import { ComponentHealth } from '../types/agent.ts';
 import { KubernetesConfig } from '../config/AgentConfig.ts';
-import { KubernetesClient, IKubernetesClient } from './KubernetesClient.ts';
+import { KubernetesClient } from './KubernetesClient.ts';
 import { ClusterDiscovery } from './discovery/ClusterDiscovery.ts';
 import { PodCollector } from './collectors/PodCollector.ts';
 import { DeploymentCollector } from './collectors/DeploymentCollector.ts';
@@ -20,6 +23,14 @@ import { EventCollector } from './collectors/EventCollector.ts';
 import { PodWatcher } from './watchers/PodWatcher.ts';
 import { EventWatcher } from './watchers/EventWatcher.ts';
 import { EvidenceNormalizer } from '../evidence/EvidenceNormalizer.ts';
+import { ResourceGraph } from './graph/ResourceGraph.ts';
+import { ChangeTracker } from '../changes/ChangeTracker.ts';
+import { LogCollector } from '../logs/LogCollector.ts';
+import { DetectionEngine } from '../detection/DetectionEngine.ts';
+import { CorrelationEngine } from '../correlation/CorrelationEngine.ts';
+import { InvestigationEngine } from '../investigation/InvestigationEngine.ts';
+import { ActionExecutor } from '../remediation/ActionExecutor.ts';
+import { ActionVerifier } from '../remediation/ActionVerifier.ts';
 import { Logger } from '../observability/Logger.ts';
 
 export class KubernetesCapability implements Capability {
@@ -28,7 +39,7 @@ export class KubernetesCapability implements Capability {
   public readonly version = '1.0.0';
 
   private readonly config: KubernetesConfig;
-  private client?: IKubernetesClient;
+  private client?: KubernetesClient;
   private discovery?: ClusterDiscovery;
   private normalizer?: EvidenceNormalizer;
   private podCollector?: PodCollector;
@@ -37,6 +48,16 @@ export class KubernetesCapability implements Capability {
   private eventCollector?: EventCollector;
   private podWatcher?: PodWatcher;
   private eventWatcher?: EventWatcher;
+
+  // Intelligence Subsystems
+  private graph?: ResourceGraph;
+  private changeTracker?: ChangeTracker;
+  private logCollector?: LogCollector;
+  private detectionEngine?: DetectionEngine;
+  private correlationEngine?: CorrelationEngine;
+  private investigationEngine?: InvestigationEngine;
+  private actionExecutor?: ActionExecutor;
+  private actionVerifier?: ActionVerifier;
 
   private context?: CapabilityContext;
   private logger: Logger;
@@ -60,6 +81,22 @@ export class KubernetesCapability implements Capability {
       this.config.clusterName
     );
 
+    // Instantiate intelligence layers
+    this.graph = new ResourceGraph(this.logger);
+    this.changeTracker = new ChangeTracker(this.logger);
+    this.logCollector = new LogCollector(this.client, this.logger);
+    this.detectionEngine = new DetectionEngine(this.logger);
+    this.correlationEngine = new CorrelationEngine(this.graph, 5 * 60 * 1000, this.logger);
+    this.investigationEngine = new InvestigationEngine(
+      this.client,
+      this.graph,
+      this.changeTracker,
+      this.logCollector,
+      this.logger
+    );
+    this.actionExecutor = new ActionExecutor(this.client, this.logger);
+    this.actionVerifier = new ActionVerifier(this.client, this.logger);
+
     this.discovery = new ClusterDiscovery(this.client, this.logger);
     this.podCollector = new PodCollector(this.client, this.normalizer, this.logger);
     this.deploymentCollector = new DeploymentCollector(this.client, this.normalizer, this.logger);
@@ -71,17 +108,27 @@ export class KubernetesCapability implements Capability {
   }
 
   public async discover(): Promise<unknown> {
-    if (!this.discovery) {
+    if (!this.discovery || !this.graph || !this.changeTracker) {
       throw new Error('KubernetesCapability not initialized');
     }
-    return await this.discovery.discover();
+    const snapshot = await this.discovery.discover();
+
+    // 1. Maintain Resource Graph
+    this.graph.buildFromSnapshot(snapshot);
+
+    // 2. Track changes across discovery cycles
+    this.changeTracker.trackDeployments(snapshot.deployments);
+    this.changeTracker.trackNodes(snapshot.nodes);
+    this.changeTracker.trackServices(snapshot.services);
+
+    return snapshot;
   }
 
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    // 1. Run initial discovery
+    // 1. Run initial discovery & graph build
     try {
       await this.discover();
     } catch (err) {
@@ -97,7 +144,7 @@ export class KubernetesCapability implements Capability {
       await this.runCollectionCycle();
     }, this.config.collectionIntervalSeconds * 1000);
 
-    // 4. Start periodic background discovery
+    // 4. Start periodic background discovery & graph refresh
     this.discoveryTimer = setInterval(async () => {
       try {
         await this.discover();
@@ -123,7 +170,13 @@ export class KubernetesCapability implements Capability {
 
       const allEvidences = [...podEvidences, ...deployEvidences, ...nodeEvidences];
 
-      // Enqueue detected signals and high severity items
+      // Correlate new signals and build failure chains
+      if (this.correlationEngine && this.changeTracker) {
+        const recentChanges = this.changeTracker.getAllChanges();
+        this.correlationEngine.correlate(allEvidences, recentChanges);
+      }
+
+      // Enqueue detected signals into the persistent queue
       for (const ev of allEvidences) {
         if (ev.kind === 'SIGNAL' || ev.severity === 'WARN' || ev.severity === 'ERROR' || ev.severity === 'CRITICAL') {
           await this.context.queue.enqueue(ev);
@@ -165,11 +218,51 @@ export class KubernetesCapability implements Capability {
         clusterName: this.config.clusterName,
         running: this.isRunning,
         lastSnapshotTime: this.discovery?.getLastSnapshot()?.timestamp,
+        graphNodesCount: this.graph?.getAllNodes().length,
+        graphEdgesCount: this.graph?.getAllEdges().length,
+        investigationScope: this.investigationEngine?.getScope(),
       },
     };
   }
 
+  // Getters for subsystems
   public getDiscoverySnapshot() {
     return this.discovery?.getLastSnapshot();
+  }
+
+  public getGraph(): ResourceGraph | undefined {
+    return this.graph;
+  }
+
+  public getChangeTracker(): ChangeTracker | undefined {
+    return this.changeTracker;
+  }
+
+  public getLogCollector(): LogCollector | undefined {
+    return this.logCollector;
+  }
+
+  public getDetectionEngine(): DetectionEngine | undefined {
+    return this.detectionEngine;
+  }
+
+  public getCorrelationEngine(): CorrelationEngine | undefined {
+    return this.correlationEngine;
+  }
+
+  public getInvestigationEngine(): InvestigationEngine | undefined {
+    return this.investigationEngine;
+  }
+
+  public getActionExecutor(): ActionExecutor | undefined {
+    return this.actionExecutor;
+  }
+
+  public getActionVerifier(): ActionVerifier | undefined {
+    return this.actionVerifier;
+  }
+
+  public getClient(): KubernetesClient | undefined {
+    return this.client;
   }
 }

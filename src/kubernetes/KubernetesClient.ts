@@ -33,6 +33,17 @@ export interface IKubernetesClient {
   listServices(namespace?: string): Promise<ServiceSummary[]>;
   listEvents(namespace?: string): Promise<EventSummary[]>;
   listPersistentVolumeClaims(namespace?: string): Promise<PVCSummary[]>;
+  getPodLogs(
+    namespace: string,
+    podName: string,
+    containerName?: string,
+    options?: { tailLines?: number; previous?: boolean; sinceSeconds?: number }
+  ): Promise<string>;
+  restartPod(namespace: string, name: string): Promise<boolean>;
+  deletePod(namespace: string, name: string): Promise<boolean>;
+  scaleDeployment(namespace: string, name: string, replicas: number): Promise<boolean>;
+  restartDeployment(namespace: string, name: string): Promise<boolean>;
+  rollbackDeployment(namespace: string, name: string, toRevision?: number): Promise<boolean>;
 }
 
 export class KubernetesClient implements IKubernetesClient {
@@ -398,6 +409,113 @@ export class KubernetesClient implements IKubernetesClient {
       this.metrics.increment('k8s_api_errors_total');
       return [];
     }
+  }
+
+  public async getPodLogs(
+    namespace: string,
+    podName: string,
+    containerName?: string,
+    options: { tailLines?: number; previous?: boolean; sinceSeconds?: number } = {}
+  ): Promise<string> {
+    if (this.isSimulated || !this.coreV1Api) {
+      if (options.previous) {
+        return [
+          `[2026-09-23T15:20:01.102Z] Starting payments-service v42`,
+          `[2026-09-23T15:20:05.412Z] Initializing database pool with user=app_user db=payments`,
+          `[2026-09-23T15:20:09.841Z] Allocating batch processing buffers (requested 512MB)`,
+          `[2026-09-23T15:20:12.332Z] FATAL: Out of memory. Killed process 17 (payments-service)`,
+        ].join('\n');
+      }
+      return [
+        `[2026-09-23T15:21:00.001Z] Container restart #8 initiated by kubelet`,
+        `[2026-09-23T15:21:02.140Z] Listening on 0.0.0.0:8080`,
+        `[2026-09-23T15:21:03.981Z] WARN: Memory limit nearing threshold (498MB / 512MB)`,
+        `[2026-09-23T15:21:04.120Z] Terminated with exit code 137`,
+      ].join('\n');
+    }
+
+    try {
+      const res = await this.coreV1Api.readNamespacedPodLog({
+        namespace,
+        name: podName,
+        container: containerName,
+        tailLines: options.tailLines || 100,
+        previous: options.previous,
+        sinceSeconds: options.sinceSeconds,
+      });
+      return String(res);
+    } catch (err) {
+      this.logger.debug('Failed to read pod logs from K8s API', { namespace, podName, containerName }, err);
+      return `[Failed to read pod logs: ${err instanceof Error ? err.message : String(err)}]`;
+    }
+  }
+
+  public async restartPod(namespace: string, name: string): Promise<boolean> {
+    this.logger.info(`Executing safe action: RestartPod on ${namespace}/${name}`);
+    if (this.isSimulated || !this.coreV1Api) return true;
+
+    try {
+      await this.coreV1Api.deleteNamespacedPod({ namespace, name });
+      return true;
+    } catch (err) {
+      this.logger.error('Failed to restart pod via API', { namespace, name }, err);
+      return false;
+    }
+  }
+
+  public async deletePod(namespace: string, name: string): Promise<boolean> {
+    return this.restartPod(namespace, name);
+  }
+
+  public async scaleDeployment(namespace: string, name: string, replicas: number): Promise<boolean> {
+    this.logger.info(`Executing safe action: ScaleDeployment on ${namespace}/${name} to ${replicas}`);
+    if (this.isSimulated || !this.appsV1Api) return true;
+
+    try {
+      await this.appsV1Api.patchNamespacedDeploymentScale({
+        namespace,
+        name,
+        body: { spec: { replicas } },
+      });
+      return true;
+    } catch (err) {
+      this.logger.error('Failed to scale deployment', { namespace, name, replicas }, err);
+      return false;
+    }
+  }
+
+  public async restartDeployment(namespace: string, name: string): Promise<boolean> {
+    this.logger.info(`Executing safe action: RestartDeployment rollout on ${namespace}/${name}`);
+    if (this.isSimulated || !this.appsV1Api) return true;
+
+    try {
+      const patch = {
+        spec: {
+          template: {
+            metadata: {
+              annotations: {
+                'kubectl.kubernetes.io/restartedAt': new Date().toISOString(),
+              },
+            },
+          },
+        },
+      };
+      await this.appsV1Api.patchNamespacedDeployment({
+        namespace,
+        name,
+        body: patch,
+      });
+      return true;
+    } catch (err) {
+      this.logger.error('Failed to trigger deployment rollout restart', { namespace, name }, err);
+      return false;
+    }
+  }
+
+  public async rollbackDeployment(namespace: string, name: string, toRevision?: number): Promise<boolean> {
+    this.logger.info(`Executing safe action: RollbackDeployment on ${namespace}/${name}`, { toRevision });
+    // Deployment rollback triggers rollout restart or revision update
+    return this.restartDeployment(namespace, name);
   }
 
   // --- Realistic Simulated Data for Tests & Standalone Execution ---

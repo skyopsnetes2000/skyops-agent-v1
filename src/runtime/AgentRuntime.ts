@@ -321,4 +321,56 @@ export class AgentRuntime {
   public getQueue() {
     return this.queue;
   }
+
+  public getKubernetesCapability(): KubernetesCapability {
+    return this.k8sCapability;
+  }
+
+  public getTransportClient(): TransportClient {
+    return this.transportClient;
+  }
+
+  public async launchInvestigation(
+    signal: import('../types/evidence.ts').Evidence,
+    relatedSignals: import('../types/evidence.ts').Evidence[] = []
+  ): Promise<import('../types/investigation.ts').InvestigationContext> {
+    const engine = this.k8sCapability.getInvestigationEngine();
+    if (!engine) {
+      throw new Error('Investigation engine is not initialized');
+    }
+    const incidentId = `inc_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const context = await engine.investigate(
+      incidentId,
+      this.config.environmentId,
+      this.identityManager.getIdentity()?.agentId || this.config.agentId || 'agent-unknown',
+      signal,
+      relatedSignals
+    );
+
+    // Attempt to upload investigation context to SkyOps Cloud if connected
+    try {
+      if (this.transportClient?.isConnected()) {
+        await this.transportClient.uploadInvestigation(context);
+        this.logger.info(`Investigation context successfully transmitted to SkyOps Cloud`, { incidentId });
+      }
+    } catch (err) {
+      this.logger.warn('Failed transmitting investigation to cloud; preserved locally', undefined, err);
+    }
+
+    return context;
+  }
+
+  public async executeRemediation(
+    action: import('../types/investigation.ts').RemediationAction
+  ): Promise<import('../types/investigation.ts').RemediationActionResult> {
+    const executor = this.k8sCapability.getActionExecutor();
+    const verifier = this.k8sCapability.getActionVerifier();
+    if (!executor || !verifier) {
+      throw new Error('Remediation subsystem is not initialized');
+    }
+
+    const execResult = await executor.execute(action);
+    const verifiedResult = await verifier.verify(action, execResult);
+    return verifiedResult;
+  }
 }

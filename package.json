@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test tests/config.test.ts tests/identity.test.ts tests/security.test.ts tests/signals.test.ts tests/evidence.test.ts tests/queue.test.ts tests/runtime.test.ts",
+    "test": "tsx --test tests/config.test.ts tests/identity.test.ts tests/security.test.ts tests/signals.test.ts tests/evidence.test.ts tests/queue.test.ts tests/runtime.test.ts tests/graph.test.ts tests/changes_and_logs.test.ts tests/correlation_and_investigation.test.ts tests/remediation.test.ts",
     "agent": "tsx src/main/index.ts"
   },
   "dependencies": {
