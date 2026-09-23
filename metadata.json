@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "SkyOps Agent V1",
+  "description": "Lightweight, production-grade Kubernetes operations agent for evidence collection, signal detection, and incident intelligence.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
